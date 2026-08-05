@@ -290,10 +290,19 @@ def process_index(name, config):
 • *Target 1 (+{t1_pct}%):* ₹{t1_price} (+{t1_pts} pts)
 • *Target 2 (+{t2_pct}%):* ₹{t2_price} (+{t2_pts} pts)
 """
+
+    # Button configuration (Mobile & Web Friendly)
     tv_symbol = config["tv_chart"]
+    
+    # Nifty / Sensex / BankNifty ke mutabiq direct mobile-friendly option chain link
+    if "NIFTY" in name and "BANK" not in name:
+        oc_url = "https://www.nseindia.com/option-chain"
+    else:
+        oc_url = "https://upstox.com/option-chain/"
+
     buttons = [
         {"text": f"📈 {name} Chart", "url": f"https://in.tradingview.com/chart/?symbol={tv_symbol}"},
-        {"text": "📊 Upstox Option Chain", "url": "https://pro.upstox.com/option-chain"}
+        {"text": "📊 Live Option Chain", "url": oc_url}
     ]
 
     return msg, buttons
@@ -316,5 +325,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
