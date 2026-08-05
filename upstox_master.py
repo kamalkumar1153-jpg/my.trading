@@ -9,13 +9,13 @@ from datetime import datetime
 TELEGRAM_BOT_TOKEN = "8642052658:AAH1o7maezHyHPgxeOxeiGLQ3wvu1JglvKI"
 TELEGRAM_CHAT_ID = "5598707490"
 
-# Default Level Percentages
+# Default Risk Level Percentages
 BASE_SL_PERCENT = 15.0
 BASE_TARGET1_PERCENT = 25.0
 BASE_TARGET2_PERCENT = 50.0
+BASE_TARGET3_PERCENT = 85.0
 
 # Index Configuration Matrix
-# Weekdays: 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
 INDICES = {
     "NIFTY": {
         "upstox_key": "NSE_INDEX|Nifty 50",
@@ -112,11 +112,43 @@ def calculate_rsi(prices, period=14):
     return 100.0 - (100.0 / (1.0 + rs))
 
 def calculate_vwap(high, low, close):
-    # Approximation for intraday VWAP proxy using Typical Price
     return (high + low + close) / 3.0
 
+def get_multi_timeframe_data(yahoo_symbol):
+    """
+    Fetches both 5m and 15m trend confirmations
+    """
+    trend_5m = "NEUTRAL"
+    trend_15m = "NEUTRAL"
+    try:
+        # 5 Minute Data
+        url_5m = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?range=1d&interval=5m"
+        req = urllib.request.Request(url_5m, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            closes_5m = [p for p in data['chart']['result'][0]['indicators']['quote'][0]['close'] if p is not None]
+            if len(closes_5m) >= 5:
+                ema_fast = calculate_ema(closes_5m, 3)
+                ema_slow = calculate_ema(closes_5m, 5)
+                trend_5m = "BULLISH" if ema_fast > ema_slow else "BEARISH"
+
+        # 15 Minute Data
+        url_15m = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?range=1d&interval=15m"
+        req = urllib.request.Request(url_15m, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            closes_15m = [p for p in data['chart']['result'][0]['indicators']['quote'][0]['close'] if p is not None]
+            if len(closes_15m) >= 5:
+                ema_fast15 = calculate_ema(closes_15m, 3)
+                ema_slow15 = calculate_ema(closes_15m, 5)
+                trend_15m = "BULLISH" if ema_fast15 > ema_slow15 else "BEARISH"
+
+    except Exception as e:
+        log_activity(f"MTF Fetch Warning: {e}")
+
+    return trend_5m, trend_15m
+
 def get_india_vix():
-    # Dynamic VIX Fetching with Fallback
     try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EINDIAVIX?range=1d&interval=5m"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -125,7 +157,7 @@ def get_india_vix():
             meta = data['chart']['result'][0]['meta']
             return float(meta['regularMarketPrice'])
     except Exception:
-        return 14.0  # Normal Default VIX
+        return 14.0
 
 def get_upstox_market_data(upstox_key):
     token = get_token()
@@ -208,7 +240,7 @@ def check_is_expiry(config):
 
 def log_trade_to_csv(data_row):
     file_exists = os.path.isfile("trade_journal.csv")
-    fields = ["Timestamp", "Index", "Signal", "Strike", "Spot", "Entry_Premium", "SL", "Target1", "Target2", "VIX"]
+    fields = ["Timestamp", "Index", "Signal", "Strike", "Spot", "Entry_Premium", "SL", "Target1", "Target2", "Target3", "MTF_Status", "VIX"]
     try:
         with open("trade_journal.csv", "a", newline="") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fields)
@@ -220,7 +252,7 @@ def log_trade_to_csv(data_row):
         log_activity(f"CSV Logging Error: {e}")
 
 def process_index(name, config, vix_val):
-    log_activity(f"⚡ Processing {name} with Advanced Filters...")
+    log_activity(f"⚡ Processing {name} with Multi-Timeframe Engine...")
     
     res = get_upstox_market_data(config["upstox_key"])
     if res:
@@ -234,12 +266,14 @@ def process_index(name, config, vix_val):
             log_activity(f"❌ Failed to fetch market data for {name}")
             return None, None, None
 
-    # Dynamic Risk Adjustment Based on VIX
+    # Multi-Timeframe Alignment Check (5m vs 15m)
+    trend_5m, trend_15m = get_multi_timeframe_data(config["yahoo_symbol"])
+
     vix_modifier = 1.0
     if vix_val > 16.0:
-        vix_modifier = 1.25  # Dynamic Wider SL/Target in High Volatility
+        vix_modifier = 1.25
     elif vix_val < 11.0:
-        vix_modifier = 0.85  # Tighter SL/Target in Low Volatility
+        vix_modifier = 0.85
 
     is_expiry_day = check_is_expiry(config)
 
@@ -247,14 +281,15 @@ def process_index(name, config, vix_val):
         sl_pct = 10.0 * vix_modifier
         t1_pct = 40.0 * vix_modifier
         t2_pct = 100.0 * vix_modifier
+        t3_pct = 150.0 * vix_modifier
         expiry_tag = "🔥 *EXPIRY DAY (HERO-ZERO MODE)*"
     else:
         sl_pct = BASE_SL_PERCENT * vix_modifier
         t1_pct = BASE_TARGET1_PERCENT * vix_modifier
         t2_pct = BASE_TARGET2_PERCENT * vix_modifier
+        t3_pct = BASE_TARGET3_PERCENT * vix_modifier
         expiry_tag = "📅 Regular Session"
 
-    # Indicators: EMA, RSI, VWAP
     ema9 = calculate_ema(close_series, 3)
     ema21 = calculate_ema(close_series, 5)
     rsi = calculate_rsi(close_series, 14)
@@ -263,19 +298,19 @@ def process_index(name, config, vix_val):
     step = config["step"]
     atm_strike = round(spot_price / step) * step
 
-    # Advanced Entry Rules (Technical + VWAP Validation)
-    if spot_price > ema9 and ema9 >= ema21 and rsi > 52 and spot_price >= vwap_val:
+    # Technical + VWAP + Multi-Timeframe Alignment
+    if spot_price > ema9 and ema9 >= ema21 and rsi > 52 and spot_price >= vwap_val and trend_5m == "BULLISH" and trend_15m == "BULLISH":
         action_type = "CALL (CE)"
-        signal_direction = "🟢 STRONG BULLISH (VWAP CONFIRMED)"
+        signal_direction = "🟢 STRONG BULLISH (5M + 15M ALIGNED)"
         recommended_strike = f"{atm_strike} CE"
         trade_active = True
-    elif spot_price < ema9 and ema9 <= ema21 and rsi < 48 and spot_price <= vwap_val:
+    elif spot_price < ema9 and ema9 <= ema21 and rsi < 48 and spot_price <= vwap_val and trend_5m == "BEARISH" and trend_15m == "BEARISH":
         action_type = "PUT (PE)"
-        signal_direction = "🔴 STRONG BEARISH (VWAP CONFIRMED)"
+        signal_direction = "🔴 STRONG BEARISH (5M + 15M ALIGNED)"
         recommended_strike = f"{atm_strike} PE"
         trade_active = True
     else:
-        signal_direction = "⚠️ SIDEWAYS / NO TRADE ZONE"
+        signal_direction = "⚠️ NO ALIGNMENT / RANGE-BOUND"
         trade_active = False
 
     if not trade_active:
@@ -283,12 +318,12 @@ def process_index(name, config, vix_val):
 {expiry_tag}
 
 📍 *Spot:* `{spot_price:.2f}` | *Bias:* {signal_direction}
-📊 *Filters:* EMA(9/21): `{ema9:.1f}/{ema21:.1f}` | RSI: `{rsi:.1f}` | VWAP: `{vwap_val:.1f}` | VIX: `{vix_val:.1f}`
-⏸️ *Status:* Range-bound or VWAP mismatch. Avoid trades.
+📊 *Trend Alignment:* 5M (`{trend_5m}`) | 15M (`{trend_15m}`)
+📊 *Indicators:* VWAP: `{vwap_val:.1f}` | RSI: `{rsi:.1f}` | VIX: `{vix_val:.1f}`
+⏸️ *Status:* Timeframe mismatch or range-bound market. Avoid trades.
 """
         return msg, None, None
 
-    # Fetch Premium Data
     ce_ltp, pe_ltp = get_option_chain_data(config["upstox_key"], atm_strike)
     
     if "CE" in action_type and ce_ltp and ce_ltp > 0:
@@ -304,12 +339,13 @@ def process_index(name, config, vix_val):
     sl_pts = round(estimated_premium * (sl_pct / 100), 1)
     t1_pts = round(estimated_premium * (t1_pct / 100), 1)
     t2_pts = round(estimated_premium * (t2_pct / 100), 1)
+    t3_pts = round(estimated_premium * (t3_pct / 100), 1)
 
     sl_price = round(estimated_premium - sl_pts, 1)
     t1_price = round(estimated_premium + t1_pts, 1)
     t2_price = round(estimated_premium + t2_pts, 1)
+    t3_price = round(estimated_premium + t3_pts, 1)
 
-    # Log Active Trade to CSV
     log_trade_to_csv({
         "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "Index": name,
@@ -320,22 +356,25 @@ def process_index(name, config, vix_val):
         "SL": sl_price,
         "Target1": t1_price,
         "Target2": t2_price,
+        "Target3": t3_price,
+        "MTF_Status": f"5M:{trend_5m}|15M:{trend_15m}",
         "VIX": vix_val
     })
 
-    msg = f"""🔥 *{name} HIGH-CONFIRMATION SIGNAL*
+    msg = f"""🔥 *{name} INSTITUTIONAL SIGNAL*
 {expiry_tag}
 
 📍 *Spot:* `{spot_price:.2f}` | *Bias:* {signal_direction}
-📊 *Tech Filters:* VWAP: `{vwap_val:.1f}` | RSI: `{rsi:.1f}` | India VIX: `{vix_val:.1f}`
+📊 *MTF Confirmation:* 5m ({trend_5m}) + 15m ({trend_15m}) 🟢
 ⚡ *Trade:* BUY *{recommended_strike}* ({action_type})
 🏷️ *Price Feed:* {prem_source}
 
-📊 *LEVELS:*
+📊 *DYNAMIC MULTI-LOT LEVELS:*
 • *Buy Range:* ₹{estimated_premium}
 • *SL (-{sl_pct:.1f}%):* ₹{sl_price} (-{sl_pts} pts)
-• *Target 1 (+{t1_pct:.1f}%):* ₹{t1_price} (+{t1_pts} pts)
-• *Target 2 (+{t2_pct:.1f}%):* ₹{t2_price} (+{t2_pts} pts)
+• *Target 1 (Book 50% Lot):* ₹{t1_price} (+{t1_pts} pts)
+• *Target 2 (Book 30% Lot):* ₹{t2_price} (+{t2_pts} pts)
+• *Target 3 (Trail 20% Runner):* ₹{t3_price} (+{t3_pts} pts)
 """
 
     tv_symbol = config["tv_chart"]
@@ -345,8 +384,8 @@ def process_index(name, config, vix_val):
         oc_url = "https://upstox.com/option-chain/"
 
     buttons = [
-        {"text": f"📈 {name} Chart", "url": f"https://in.tradingview.com/chart/?symbol={tv_symbol}"},
-        {"text": "📊 Live Option Chain", "url": oc_url}
+        [{"text": f"📈 {name} Chart", "url": f"https://in.tradingview.com/chart/?symbol={tv_symbol}"},
+         {"text": "📊 Live Option Chain", "url": oc_url}]
     ]
 
     trade_monitor_info = {
@@ -356,8 +395,8 @@ def process_index(name, config, vix_val):
         "sl": sl_price,
         "t1": t1_price,
         "t2": t2_price,
+        "t3": t3_price,
         "upstox_key": config["upstox_key"],
-        "yahoo_symbol": config["yahoo_symbol"],
         "atm_strike": atm_strike,
         "action": action_type
     }
@@ -368,25 +407,24 @@ def monitor_live_trades(active_trades):
     if not active_trades:
         return
     
-    log_activity("📡 Starting Live Auto Trailing SL & Target Hit Monitoring...")
-    # Monitor active positions for up to 10 cycles (approx 5 minutes per run)
+    log_activity("📡 Dynamic Multi-Lot Trade Trailing Engine Active...")
     for _ in range(5):
         time.sleep(30)
         for trade in active_trades:
             ce_ltp, pe_ltp = get_option_chain_data(trade["upstox_key"], trade["atm_strike"])
-            current_price = None
-            if "CE" in trade["action"] and ce_ltp:
-                current_price = ce_ltp
-            elif "PE" in trade["action"] and pe_ltp:
-                current_price = pe_ltp
+            current_price = ce_ltp if "CE" in trade["action"] else pe_ltp
 
-            if current_price:
-                if current_price >= trade["t2"]:
-                    alert = f"🚀 *{trade['index']} TARGET 2 HIT!* 🎉\n\nStrike: *{trade['strike']}*\nEntry: ₹{trade['entry']} ➡️ Current: ₹{current_price}\n🔥 *Full Profit Booked!*"
+            if current_price and current_price > 0:
+                if current_price >= trade["t3"]:
+                    alert = f"🚀 *{trade['index']} TARGET 3 (RUNNER) HIT!* 🎉\n\nStrike: *{trade['strike']}*\nEntry: ₹{trade['entry']} ➡️ Current: ₹{current_price}\n🔥 *100% Multi-Lot Targets Accomplished!*"
                     send_telegram_message(alert)
                     active_trades.remove(trade)
+                elif current_price >= trade["t2"] and not trade.get("t2_alert_sent"):
+                    alert = f"🎯 *{trade['index']} TARGET 2 HIT!* 👏\n\nStrike: *{trade['strike']}*\nEntry: ₹{trade['entry']} ➡️ Current: ₹{current_price}\n💰 *ACTION:* Book additional 30% Lot profit. Trail remaining 20% Lot for T3."
+                    send_telegram_message(alert)
+                    trade["t2_alert_sent"] = True
                 elif current_price >= trade["t1"] and not trade.get("t1_alert_sent"):
-                    alert = f"🎯 *{trade['index']} TARGET 1 HIT!* 👏\n\nStrike: *{trade['strike']}*\nEntry: ₹{trade['entry']} ➡️ Current: ₹{current_price}\n🛡️ *ACTION:* Stop Loss ko Entry Price (₹{trade['entry']}) par Shift (Trail) kar dein!"
+                    alert = f"🎯 *{trade['index']} TARGET 1 HIT!* 👏\n\nStrike: *{trade['strike']}*\nEntry: ₹{trade['entry']} ➡️ Current: ₹{current_price}\n🛡️ *ACTION:* Book 50% Lot Profit! Move Stop Loss to Entry Price (₹{trade['entry']}). Trade is now RISK-FREE."
                     send_telegram_message(alert)
                     trade["t1_alert_sent"] = True
                 elif current_price <= trade["sl"]:
@@ -395,7 +433,7 @@ def monitor_live_trades(active_trades):
                     active_trades.remove(trade)
 
 def main():
-    log_activity("🚀 Institutional Multi-Index Algo Engine Started")
+    log_activity("🚀 Institutional Multi-Index Algo Engine (MTF + Multi-Lot) Started")
     vix_val = get_india_vix()
     full_alert = f"🎯 *MULTI-INDEX HIGH-CONFIRMATION SIGNAL*\n*India VIX:* `{vix_val:.2f}`\n\n"
     all_buttons = []
@@ -406,11 +444,11 @@ def main():
         if signal_text:
             full_alert += signal_text + "\n" + "─"*25 + "\n\n"
             if btns:
-                all_buttons.append(btns)
+                all_buttons.extend(btns)
             if trade_info:
                 active_trades.append(trade_info)
 
-    full_alert += "🛡️ *RISK RULES:* Target 1 hit hone par Stop Loss ko Entry price par shift karein."
+    full_alert += "🛡️ *MULTI-LOT RULE:* T1 par 50% book karke SL Entry price par lock karein."
 
     send_telegram_message(full_alert, inline_keyboard=all_buttons)
     
@@ -419,6 +457,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
