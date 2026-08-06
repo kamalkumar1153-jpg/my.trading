@@ -58,7 +58,9 @@ def send_telegram_message(message, inline_keyboard=None):
         "text": message,
         "parse_mode": "Markdown"
     }
-    if inline_keyboard:
+    
+    # Empty inline keyboard error protection
+    if inline_keyboard and len(inline_keyboard) > 0:
         payload_dict["reply_markup"] = {"inline_keyboard": inline_keyboard}
 
     payload = json.dumps(payload_dict).encode('utf-8')
@@ -115,9 +117,6 @@ def calculate_vwap(high, low, close):
     return (high + low + close) / 3.0
 
 def get_multi_timeframe_data(yahoo_symbol):
-    """
-    Fetches both 5m and 15m trend confirmations
-    """
     trend_5m = "NEUTRAL"
     trend_15m = "NEUTRAL"
     try:
@@ -298,7 +297,15 @@ def process_index(name, config, vix_val):
     step = config["step"]
     atm_strike = round(spot_price / step) * step
 
-    # Technical + VWAP + Multi-Timeframe Alignment
+    # Setup Buttons
+    tv_symbol = config["tv_chart"]
+    oc_url = "https://www.nseindia.com/option-chain" if "NIFTY" in name and "BANK" not in name else "https://upstox.com/option-chain/"
+    buttons = [
+        [{"text": f"📈 {name} Chart", "url": f"https://in.tradingview.com/chart/?symbol={tv_symbol}"},
+         {"text": "📊 Option Chain", "url": oc_url}]
+    ]
+
+    # Technical + VWAP + Multi-Timeframe Alignment Check
     if spot_price > ema9 and ema9 >= ema21 and rsi > 52 and spot_price >= vwap_val and trend_5m == "BULLISH" and trend_15m == "BULLISH":
         action_type = "CALL (CE)"
         signal_direction = "🟢 STRONG BULLISH (5M + 15M ALIGNED)"
@@ -314,15 +321,15 @@ def process_index(name, config, vix_val):
         trade_active = False
 
     if not trade_active:
-        msg = f"""🔥 *{name} MARKET ANALYSIS*
+        msg = f"""🔥 *{name} MARKET STATUS*
 {expiry_tag}
 
 📍 *Spot:* `{spot_price:.2f}` | *Bias:* {signal_direction}
 📊 *Trend Alignment:* 5M (`{trend_5m}`) | 15M (`{trend_15m}`)
 📊 *Indicators:* VWAP: `{vwap_val:.1f}` | RSI: `{rsi:.1f}` | VIX: `{vix_val:.1f}`
-⏸️ *Status:* Timeframe mismatch or range-bound market. Avoid trades.
+⏸️ *Status:* Timeframe mismatch or range-bound market.
 """
-        return msg, None, None
+        return msg, buttons, None
 
     ce_ltp, pe_ltp = get_option_chain_data(config["upstox_key"], atm_strike)
     
@@ -377,17 +384,6 @@ def process_index(name, config, vix_val):
 • *Target 3 (Trail 20% Runner):* ₹{t3_price} (+{t3_pts} pts)
 """
 
-    tv_symbol = config["tv_chart"]
-    if "NIFTY" in name and "BANK" not in name:
-        oc_url = "https://www.nseindia.com/option-chain"
-    else:
-        oc_url = "https://upstox.com/option-chain/"
-
-    buttons = [
-        [{"text": f"📈 {name} Chart", "url": f"https://in.tradingview.com/chart/?symbol={tv_symbol}"},
-         {"text": "📊 Live Option Chain", "url": oc_url}]
-    ]
-
     trade_monitor_info = {
         "index": name,
         "strike": recommended_strike,
@@ -435,7 +431,7 @@ def monitor_live_trades(active_trades):
 def main():
     log_activity("🚀 Institutional Multi-Index Algo Engine (MTF + Multi-Lot) Started")
     vix_val = get_india_vix()
-    full_alert = f"🎯 *MULTI-INDEX HIGH-CONFIRMATION SIGNAL*\n*India VIX:* `{vix_val:.2f}`\n\n"
+    full_alert = f"🎯 *MULTI-INDEX TRADING ALGO REPORT*\n*India VIX:* `{vix_val:.2f}`\n\n"
     all_buttons = []
     active_trades = []
 
@@ -457,6 +453,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
