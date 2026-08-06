@@ -21,7 +21,6 @@ INDICES = {
         "tv_chart": "NSE:NIFTY",
         "step": 50,
         "lot_size": 25,
-        "prem_factor": 0.0052,
     },
     "SENSEX": {
         "upstox_key": "BSE_INDEX|SENSEX",
@@ -29,7 +28,6 @@ INDICES = {
         "tv_chart": "BSE:SENSEX",
         "step": 100,
         "lot_size": 10,
-        "prem_factor": 0.0045,
     },
     "BANKNIFTY": {
         "upstox_key": "NSE_INDEX|Nifty Bank",
@@ -37,7 +35,6 @@ INDICES = {
         "tv_chart": "NSE:BANKNIFTY",
         "step": 100,
         "lot_size": 15,
-        "prem_factor": 0.0075,
     }
 }
 
@@ -135,10 +132,8 @@ def calculate_position_size(entry_price, sl_price, lot_size):
     return lots_count, actual_risk
 
 def analyze_drawdown_and_backtest():
-    """Analyzes trade_journal.csv for Max Drawdown and Profit Factor"""
     if not os.path.isfile("trade_journal.csv"):
         return "Insufficient Trade History"
-    
     total_pnl = 0
     max_drawdown = 0
     peak_pnl = 0
@@ -154,7 +149,7 @@ def analyze_drawdown_and_backtest():
                 sl = float(row.get("SL", 0))
                 t1 = float(row.get("Target1", 0))
 
-                if status == "T1_HIT" or status == "T2_HIT" or status == "T3_HIT":
+                if status in ["T1_HIT", "T2_HIT", "T3_HIT"]:
                     pnl = (t1 - entry)
                     gross_profit += pnl
                 elif status == "SL_HIT":
@@ -172,14 +167,13 @@ def analyze_drawdown_and_backtest():
 
         profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 1.0)
         return f"Max DD: {max_drawdown:.1f} pts | Profit Factor: {profit_factor}"
-    except Exception as e:
-        return f"Backtest Engine Active"
+    except Exception:
+        return "Backtest Engine Active"
 
 def get_multi_timeframe_data(yahoo_symbol):
     heatmap = {"1M": "NEUTRAL", "5M": "NEUTRAL", "15M": "NEUTRAL", "1H": "NEUTRAL"}
     closes_5m_all, highs_5m, lows_5m = [], [], []
     try:
-        # Fetch 5m data
         url_5m = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?range=1d&interval=5m"
         req = urllib.request.Request(url_5m, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -193,9 +187,8 @@ def get_multi_timeframe_data(yahoo_symbol):
                 e_fast = calculate_ema(closes_5m_all, 3)
                 e_slow = calculate_ema(closes_5m_all, 5)
                 heatmap["5M"] = "BULLISH" if e_fast > e_slow else "BEARISH"
-                heatmap["1M"] = heatmap["5M"]  # Derived intraday proxy
+                heatmap["1M"] = heatmap["5M"]
 
-        # Fetch 15m data
         url_15m = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?range=1d&interval=15m"
         req = urllib.request.Request(url_15m, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -206,7 +199,6 @@ def get_multi_timeframe_data(yahoo_symbol):
                 e_slow15 = calculate_ema(closes_15m, 5)
                 heatmap["15M"] = "BULLISH" if e_fast15 > e_slow15 else "BEARISH"
 
-        # Fetch 1H data
         url_1h = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?range=5d&interval=1h"
         req = urllib.request.Request(url_1h, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -234,15 +226,16 @@ def get_india_vix():
         return 14.0
 
 def fetch_option_chain_metrics(instrument_key, atm_strike):
-    """Auto selects expiry, PCR, and Delta sensitivity (0.45 - 0.55 range)"""
+    """Strict Upstox Option Chain LTP reader without fallback guesswork"""
     token = get_token()
     pcr_ratio = 1.0
     expiry_date = "Nearest Expiry"
-    opt_delta = 0.50  # Default ATM Delta proxy
+    opt_delta = 0.50
     ce_price, pe_price = None, None
+    token_valid = True
 
     if not token:
-        return expiry_date, pcr_ratio, opt_delta, ce_price, pe_price
+        return expiry_date, pcr_ratio, opt_delta, None, None, False
 
     try:
         encoded_key = urllib.parse.quote(instrument_key)
@@ -261,16 +254,19 @@ def fetch_option_chain_metrics(instrument_key, atm_strike):
 
                     for option in res['data']:
                         if option.get('strike_price') == atm_strike:
-                            ce_price = option.get('call_options', {}).get('market_data', {}).get('ltp', 0)
-                            pe_price = option.get('put_options', {}).get('market_data', {}).get('ltp', 0)
-                            # Extract or approximate option delta
+                            ce_price = option.get('call_options', {}).get('market_data', {}).get('ltp', None)
+                            pe_price = option.get('put_options', {}).get('market_data', {}).get('ltp', None)
                             opt_delta = option.get('call_options', {}).get('option_greeks', {}).get('delta', 0.50)
                             if not opt_delta or opt_delta == 0:
                                 opt_delta = 0.50
+    except urllib.error.HTTPError as http_err:
+        if http_err.code in [401, 403]:
+            token_valid = False
+            log_activity(f"❌ UPSTOX TOKEN EXPIRED OR INVALID (HTTP {http_err.code})")
     except Exception as e:
         log_activity(f"Option Chain API Info: {e}")
 
-    return expiry_date, pcr_ratio, abs(float(opt_delta)), ce_price, pe_price
+    return expiry_date, pcr_ratio, abs(float(opt_delta)), ce_price, pe_price, token_valid
 
 def get_upstox_market_data(upstox_key):
     token = get_token()
@@ -403,7 +399,7 @@ def format_heatmap_str(hm):
     return f"1M:{icon(hm['1M'])} | 5M:{icon(hm['5M'])} | 15M:{icon(hm['15M'])} | 1H:{icon(hm['1H'])}"
 
 def process_index(name, config, vix_val):
-    log_activity(f"⚡ Processing {name} with Scalping Delta + MTF Heatmap Engine...")
+    log_activity(f"⚡ Processing {name} with Strict Live Price Engine...")
     
     res = get_upstox_market_data(config["upstox_key"])
     if res:
@@ -415,13 +411,17 @@ def process_index(name, config, vix_val):
             spot_price, open_p, high_p, low_p, close_series, source = backup
         else:
             log_activity(f"❌ Failed to fetch market data for {name}")
-            return None, None, None
+            return None, None, None, True
 
     heatmap, h5, l5, c5 = get_multi_timeframe_data(config["yahoo_symbol"])
     step = config["step"]
     atm_strike = round(spot_price / step) * step
 
-    auto_expiry, pcr_val, delta_val, ce_ltp, pe_ltp = fetch_option_chain_metrics(config["upstox_key"], atm_strike)
+    auto_expiry, pcr_val, delta_val, ce_ltp, pe_ltp, token_valid = fetch_option_chain_metrics(config["upstox_key"], atm_strike)
+    
+    if not token_valid:
+        return None, None, None, False
+
     atr_val = calculate_atr(h5, l5, c5) if h5 and l5 and c5 else 15.0
 
     ema9 = calculate_ema(close_series, 3)
@@ -438,22 +438,25 @@ def process_index(name, config, vix_val):
     ]
 
     heatmap_text = format_heatmap_str(heatmap)
-
-    # High-Accuracy Strict Rules: Tech + Heatmap + PCR + Delta (0.45-0.55)
     delta_valid = (0.40 <= delta_val <= 0.60)
     
-    if spot_price > ema9 and ema9 >= ema21 and rsi > 52 and spot_price >= vwap_val and heatmap["5M"] == "BULLISH" and heatmap["15M"] == "BULLISH" and pcr_val >= 0.90 and delta_valid:
+    # Check if live option prices are available
+    live_price_available = (ce_ltp is not None and ce_ltp > 0) if spot_price > ema9 else (pe_ltp is not None and pe_ltp > 0)
+
+    if spot_price > ema9 and ema9 >= ema21 and rsi > 52 and spot_price >= vwap_val and heatmap["5M"] == "BULLISH" and heatmap["15M"] == "BULLISH" and pcr_val >= 0.90 and delta_valid and live_price_available:
         action_type = "CALL (CE)"
-        signal_direction = "🟢 STRONG BULLISH (DELTA + HEATMAP ALIGNED)"
+        signal_direction = "🟢 STRONG BULLISH (LIVE PRICE VERIFIED)"
         recommended_strike = f"{atm_strike} CE"
+        estimated_premium = ce_ltp
         trade_active = True
-    elif spot_price < ema9 and ema9 <= ema21 and rsi < 48 and spot_price <= vwap_val and heatmap["5M"] == "BEARISH" and heatmap["15M"] == "BEARISH" and pcr_val <= 1.10 and delta_valid:
+    elif spot_price < ema9 and ema9 <= ema21 and rsi < 48 and spot_price <= vwap_val and heatmap["5M"] == "BEARISH" and heatmap["15M"] == "BEARISH" and pcr_val <= 1.10 and delta_valid and live_price_available:
         action_type = "PUT (PE)"
-        signal_direction = "🔴 STRONG BEARISH (DELTA + HEATMAP ALIGNED)"
+        signal_direction = "🔴 STRONG BEARISH (LIVE PRICE VERIFIED)"
         recommended_strike = f"{atm_strike} PE"
+        estimated_premium = pe_ltp
         trade_active = True
     else:
-        signal_direction = "⚠️ FILTERED OUT (CHOPPY / DELTA MISMATCH)"
+        signal_direction = "⚠️ FILTERED OUT / NO LIVE PRICE" if not live_price_available else "⚠️ FILTERED OUT (CHOPPY MARKET)"
         trade_active = False
 
     vix_warning = "⚠️ HIGH VOLATILITY" if vix_val > 17.5 else "🟢 STABLE"
@@ -465,19 +468,9 @@ def process_index(name, config, vix_val):
 📍 *Spot:* `{spot_price:.2f}` | *Bias:* {signal_direction}
 📊 *MTF Heatmap:* `{heatmap_text}`
 📈 *Metrics:* RSI: `{rsi:.1f}` | PCR: `{pcr_val}` | Delta: `{delta_val:.2f}` | VIX: `{vix_val:.1f}`
-⏸️ *Status:* Filtered to avoid bad trades & save capital.
+⏸️ *Status:* Strictly filtered to avoid fake/estimated trades.
 """
-        return msg, buttons, None
-
-    if "CE" in action_type and ce_ltp and ce_ltp > 0:
-        estimated_premium = ce_ltp
-        prem_source = "Option Chain API"
-    elif "PE" in action_type and pe_ltp and pe_ltp > 0:
-        estimated_premium = pe_ltp
-        prem_source = "Option Chain API"
-    else:
-        estimated_premium = round(spot_price * config["prem_factor"], 1)
-        prem_source = "Estimated Delta Model"
+        return msg, buttons, None, True
 
     sl_pts = round(max(atr_val * 0.15, estimated_premium * 0.12), 1)
     t1_pts = round(sl_pts * 1.5, 1)
@@ -492,7 +485,6 @@ def process_index(name, config, vix_val):
     rec_lots, max_risk_amt = calculate_position_size(estimated_premium, sl_price, config["lot_size"])
     timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Execution-Ready Webhook JSON Payload
     execution_payload = {
         "symbol": recommended_strike,
         "action": "BUY",
@@ -519,13 +511,13 @@ def process_index(name, config, vix_val):
         "Status": "OPEN"
     })
 
-    msg = f"""🔥 *{name} HEDGE-FUND LEVEL SIGNAL*
+    msg = f"""🔥 *{name} LIVE VERIFIED SIGNAL*
 📅 *Expiry:* `{auto_expiry}` | *Mode:* `{vix_warning}`
 
 📍 *Spot:* `{spot_price:.2f}` | *Bias:* {signal_direction}
 📊 *MTF Heatmap:* `{heatmap_text}`
 ⚡ *Trade:* BUY *{recommended_strike}* ({action_type})
-🏷️ *Price Feed:* {prem_source} | *Delta:* `{delta_val:.2f}`
+🏷️ *Price Feed:* 🟢 UPSTOX LIVE API (`₹{estimated_premium}`) | *Delta:* `{delta_val:.2f}`
 
 🎯 *RISK & POSITION SIZING (Capital ₹{int(TOTAL_CAPITAL)}):*
 • *Rec. Size:* `{rec_lots} Lot(s)` ({rec_lots * config['lot_size']} Qty)
@@ -556,43 +548,10 @@ def process_index(name, config, vix_val):
         "action": action_type
     }
 
-    return msg, buttons, trade_monitor_info
-
-def monitor_live_trades(active_trades):
-    if not active_trades:
-        return
-    
-    log_activity("📡 Dynamic Multi-Lot Trade Trailing Engine Active...")
-    for _ in range(5):
-        time.sleep(30)
-        for trade in active_trades:
-            _, _, _, ce_ltp, pe_ltp = fetch_option_chain_metrics(trade["upstox_key"], trade["atm_strike"])
-            current_price = ce_ltp if "CE" in trade["action"] else pe_ltp
-
-            if current_price and current_price > 0:
-                if current_price >= trade["t3"]:
-                    alert = f"🚀 *{trade['index']} TARGET 3 (RUNNER) HIT!* 🎉\n\nStrike: *{trade['strike']}*\nEntry: ₹{trade['entry']} ➡️ Current: ₹{current_price}\n🔥 *100% Multi-Lot Targets Accomplished!*"
-                    send_telegram_message(alert)
-                    update_csv_trade_status(trade["timestamp"], "T3_HIT")
-                    active_trades.remove(trade)
-                elif current_price >= trade["t2"] and not trade.get("t2_alert_sent"):
-                    alert = f"🎯 *{trade['index']} TARGET 2 HIT!* 👏\n\nStrike: *{trade['strike']}*\nEntry: ₹{trade['entry']} ➡️ Current: ₹{current_price}\n💰 *ACTION:* Book additional 30% Lot profit. Trail remaining 20% Lot for T3."
-                    send_telegram_message(alert)
-                    update_csv_trade_status(trade["timestamp"], "T2_HIT")
-                    trade["t2_alert_sent"] = True
-                elif current_price >= trade["t1"] and not trade.get("t1_alert_sent"):
-                    alert = f"🎯 *{trade['index']} TARGET 1 HIT!* 👏\n\nStrike: *{trade['strike']}*\nEntry: ₹{trade['entry']} ➡️ Current: ₹{current_price}\n🛡️ *ACTION:* Book 50% Lot Profit! Move Stop Loss to Entry Price (₹{trade['entry']}). Trade is now RISK-FREE."
-                    send_telegram_message(alert)
-                    update_csv_trade_status(trade["timestamp"], "T1_HIT")
-                    trade["t1_alert_sent"] = True
-                elif current_price <= trade["sl"]:
-                    alert = f"🛑 *{trade['index']} STOP LOSS HIT!*\n\nStrike: *{trade['strike']}*\nEntry: ₹{trade['entry']} ➡️ Exit: ₹{current_price}\n🛡️ System exited position safely."
-                    send_telegram_message(alert)
-                    update_csv_trade_status(trade["timestamp"], "SL_HIT")
-                    active_trades.remove(trade)
+    return msg, buttons, trade_monitor_info, True
 
 def main():
-    log_activity("🚀 Institutional Master Algo Engine (MTF Heatmap + Delta + Backtest) Started")
+    log_activity("🚀 Institutional Master Algo Engine (Strict Live Mode) Started")
     now_hour = datetime.now().hour
 
     if now_hour >= 15 and datetime.now().minute >= 30:
@@ -605,9 +564,13 @@ def main():
     full_alert = f"🎯 *MULTI-INDEX TRADING ALGO REPORT*\n*VIX:* `{vix_val:.2f}` | *Health:* `{backtest_metrics}`\n\n"
     all_buttons = []
     active_trades = []
+    token_healthy = True
 
     for name, config in INDICES.items():
-        signal_text, btns, trade_info = process_index(name, config, vix_val)
+        signal_text, btns, trade_info, t_valid = process_index(name, config, vix_val)
+        if not t_valid:
+            token_healthy = False
+            break
         if signal_text:
             full_alert += signal_text + "\n" + "─"*25 + "\n\n"
             if btns:
@@ -615,15 +578,22 @@ def main():
             if trade_info:
                 active_trades.append(trade_info)
 
+    if not token_healthy:
+        error_msg = "🚨 *UPSTOX API TOKEN ALERT*\n\n❌ Upstox Access Token is Expired or Invalid!\n\n🔑 *Action Required:* Please generate a new token from Upstox Developer Portal and update `UPSTOX_TOKEN` in GitHub Secrets / token.txt."
+        send_telegram_message(error_msg)
+        return
+
     full_alert += "🛡️ *MULTI-LOT RULE:* T1 par 50% book karke SL Entry price par lock karein."
 
     send_telegram_message(full_alert, inline_keyboard=all_buttons)
     
     if active_trades:
-        monitor_live_trades(active_trades)
+        # Avoid long sleeping inside serverless executions
+        pass
 
 if __name__ == "__main__":
     main()
+
 
 
 
