@@ -9,6 +9,10 @@ from datetime import datetime
 TELEGRAM_BOT_TOKEN = "8642052658:AAH1o7maezHyHPgxeOxeiGLQ3wvu1JglvKI"
 TELEGRAM_CHAT_ID = "5598707490"
 
+# Risk Management Parameters
+TOTAL_CAPITAL = 50000.0  # Total trading account capital in INR
+MAX_RISK_PER_TRADE_PCT = 2.0  # Max risk per trade (2% = ₹1,000)
+
 # Index Configuration Matrix
 INDICES = {
     "NIFTY": {
@@ -16,6 +20,7 @@ INDICES = {
         "yahoo_symbol": "%5ENSEI",
         "tv_chart": "NSE:NIFTY",
         "step": 50,
+        "lot_size": 25,
         "prem_factor": 0.0052,
     },
     "SENSEX": {
@@ -23,6 +28,7 @@ INDICES = {
         "yahoo_symbol": "%5EBSESN",
         "tv_chart": "BSE:SENSEX",
         "step": 100,
+        "lot_size": 10,
         "prem_factor": 0.0045,
     },
     "BANKNIFTY": {
@@ -30,6 +36,7 @@ INDICES = {
         "yahoo_symbol": "%5ENSEBANK",
         "tv_chart": "NSE:BANKNIFTY",
         "step": 100,
+        "lot_size": 15,
         "prem_factor": 0.0075,
     }
 }
@@ -101,7 +108,6 @@ def calculate_rsi(prices, period=14):
     return 100.0 - (100.0 / (1.0 + rs))
 
 def calculate_atr(highs, lows, closes, period=14):
-    """Calculates Average True Range (ATR) for dynamic volatility SL"""
     if len(closes) < 2:
         return 10.0
     tr_list = []
@@ -112,6 +118,22 @@ def calculate_atr(highs, lows, closes, period=14):
 
 def calculate_vwap(high, low, close):
     return (high + low + close) / 3.0
+
+def calculate_position_size(entry_price, sl_price, lot_size):
+    """Dynamic Position Sizing based on Account Risk Parameter"""
+    risk_per_share = abs(entry_price - sl_price)
+    if risk_per_share <= 0:
+        return 1, TOTAL_CAPITAL * (MAX_RISK_PER_TRADE_PCT / 100)
+    
+    max_risk_amount = TOTAL_CAPITAL * (MAX_RISK_PER_TRADE_PCT / 100)
+    recommended_qty = int(max_risk_amount / (risk_per_share * lot_size)) * lot_size
+    
+    if recommended_qty < lot_size:
+        recommended_qty = lot_size
+        
+    actual_risk = round(recommended_qty * risk_per_share, 1)
+    lots_count = int(recommended_qty / lot_size)
+    return lots_count, actual_risk
 
 def get_multi_timeframe_data(yahoo_symbol):
     trend_5m = "NEUTRAL"
@@ -158,11 +180,13 @@ def get_india_vix():
     except Exception:
         return 14.0
 
-def fetch_auto_expiry(instrument_key):
-    """Automatically selects nearest weekly option expiry from Upstox API"""
+def fetch_auto_expiry_and_pcr(instrument_key):
+    """Auto selects weekly expiry & calculates Put-Call Ratio (PCR) from Open Interest"""
     token = get_token()
+    pcr_ratio = 1.0
+    expiry_date = "Nearest Expiry"
     if not token:
-        return "Nearest Expiry"
+        return expiry_date, pcr_ratio
     try:
         encoded_key = urllib.parse.quote(instrument_key)
         url = f"https://api.upstox.com/v2/option/chain?instrument_key={encoded_key}"
@@ -172,12 +196,14 @@ def fetch_auto_expiry(instrument_key):
             if resp.status == 200:
                 res = json.loads(resp.read().decode('utf-8'))
                 if 'data' in res and len(res['data']) > 0:
-                    exp = res['data'][0].get('expiry')
-                    if exp:
-                        return exp
+                    expiry_date = res['data'][0].get('expiry', "Nearest Expiry")
+                    total_ce_oi = sum(opt.get('call_options', {}).get('market_data', {}).get('oi', 0) for opt in res['data'])
+                    total_pe_oi = sum(opt.get('put_options', {}).get('market_data', {}).get('oi', 0) for opt in res['data'])
+                    if total_ce_oi > 0:
+                        pcr_ratio = round(total_pe_oi / total_ce_oi, 2)
     except Exception as e:
-        log_activity(f"Auto Expiry Fetch Warning: {e}")
-    return "Nearest Expiry"
+        log_activity(f"Option Chain OI/PCR Fetch Warning: {e}")
+    return expiry_date, pcr_ratio
 
 def get_upstox_market_data(upstox_key):
     token = get_token()
@@ -253,7 +279,7 @@ def get_option_chain_data(instrument_key, atm_strike, expiry_date):
 
 def log_trade_to_csv(data_row):
     file_exists = os.path.isfile("trade_journal.csv")
-    fields = ["Timestamp", "Index", "Signal", "Strike", "Spot", "Entry_Premium", "SL", "Target1", "Target2", "Target3", "MTF_Status", "VIX", "Status"]
+    fields = ["Timestamp", "Index", "Signal", "Strike", "Spot", "Entry_Premium", "SL", "Target1", "Target2", "Target3", "MTF_Status", "PCR", "VIX", "Status"]
     try:
         with open("trade_journal.csv", "a", newline="") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fields)
@@ -265,6 +291,28 @@ def log_trade_to_csv(data_row):
             log_activity("📝 Trade logged to trade_journal.csv successfully.")
     except Exception as e:
         log_activity(f"CSV Logging Error: {e}")
+
+def update_csv_trade_status(timestamp, new_status):
+    """Updates CSV log status when targets or SL hit dynamically"""
+    if not os.path.isfile("trade_journal.csv"):
+        return
+    rows = []
+    try:
+        with open("trade_journal.csv", "r") as csvfile:
+            reader = csv.DictReader(csvfile)
+            fieldnames = reader.fieldnames
+            for row in reader:
+                if row["Timestamp"] == timestamp:
+                    row["Status"] = new_status
+                rows.append(row)
+
+        with open("trade_journal.csv", "w", newline="") as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+            log_activity(f"📝 CSV Status Updated to: {new_status}")
+    except Exception as e:
+        log_activity(f"CSV Status Update Error: {e}")
 
 def generate_daily_pnl_summary():
     """Reads CSV and sends end-of-day summary to Telegram"""
@@ -315,7 +363,7 @@ def generate_daily_pnl_summary():
         log_activity(f"Daily Summary Error: {e}")
 
 def process_index(name, config, vix_val):
-    log_activity(f"⚡ Processing {name} with MTF + Dynamic ATR Engine...")
+    log_activity(f"⚡ Processing {name} with MTF + PCR + ATR Engine...")
     
     res = get_upstox_market_data(config["upstox_key"])
     if res:
@@ -330,9 +378,8 @@ def process_index(name, config, vix_val):
             return None, None, None
 
     trend_5m, trend_15m, h5, l5, c5 = get_multi_timeframe_data(config["yahoo_symbol"])
-    auto_expiry = fetch_auto_expiry(config["upstox_key"])
+    auto_expiry, pcr_val = fetch_auto_expiry_and_pcr(config["upstox_key"])
 
-    # Calculate ATR Volatility factor
     atr_val = calculate_atr(h5, l5, c5) if h5 and l5 and c5 else 15.0
 
     ema9 = calculate_ema(close_series, 3)
@@ -346,34 +393,37 @@ def process_index(name, config, vix_val):
     tv_symbol = config["tv_chart"]
     oc_url = "https://www.nseindia.com/option-chain" if "NIFTY" in name and "BANK" not in name else "https://upstox.com/option-chain/"
     
-    # Callback-style interactive UI buttons
     buttons = [
         [{"text": f"📈 {name} Chart", "url": f"https://in.tradingview.com/chart/?symbol={tv_symbol}"},
          {"text": "📊 Option Chain", "url": oc_url}]
     ]
 
-    if spot_price > ema9 and ema9 >= ema21 and rsi > 52 and spot_price >= vwap_val and trend_5m == "BULLISH" and trend_15m == "BULLISH":
+    # Technical + MTF + PCR Confirmation Engine
+    if spot_price > ema9 and ema9 >= ema21 and rsi > 52 and spot_price >= vwap_val and trend_5m == "BULLISH" and trend_15m == "BULLISH" and pcr_val >= 0.90:
         action_type = "CALL (CE)"
-        signal_direction = "🟢 STRONG BULLISH (5M + 15M ALIGNED)"
+        signal_direction = "🟢 STRONG BULLISH (MTF + PCR ALIGNED)"
         recommended_strike = f"{atm_strike} CE"
         trade_active = True
-    elif spot_price < ema9 and ema9 <= ema21 and rsi < 48 and spot_price <= vwap_val and trend_5m == "BEARISH" and trend_15m == "BEARISH":
+    elif spot_price < ema9 and ema9 <= ema21 and rsi < 48 and spot_price <= vwap_val and trend_5m == "BEARISH" and trend_15m == "BEARISH" and pcr_val <= 1.10:
         action_type = "PUT (PE)"
-        signal_direction = "🔴 STRONG BEARISH (5M + 15M ALIGNED)"
+        signal_direction = "🔴 STRONG BEARISH (MTF + PCR ALIGNED)"
         recommended_strike = f"{atm_strike} PE"
         trade_active = True
     else:
-        signal_direction = "⚠️ NO ALIGNMENT / RANGE-BOUND"
+        signal_direction = "⚠️ NO ALIGNMENT / PCR NEUTRAL"
         trade_active = False
+
+    vix_warning = "⚠️ HIGH VOLATILITY EVENT MODE" if vix_val > 17.5 else "🟢 STABLE MARKET"
 
     if not trade_active:
         msg = f"""🔥 *{name} MARKET STATUS*
-📅 *Auto Expiry:* `{auto_expiry}`
+📅 *Auto Expiry:* `{auto_expiry}` | *Volatility:* `{vix_warning}`
 
 📍 *Spot:* `{spot_price:.2f}` | *Bias:* {signal_direction}
 📊 *Trend Alignment:* 5M (`{trend_5m}`) | 15M (`{trend_15m}`)
-📊 *Indicators:* VWAP: `{vwap_val:.1f}` | RSI: `{rsi:.1f}` | ATR: `{atr_val:.1f}` | VIX: `{vix_val:.1f}`
-⏸️ *Status:* Timeframe mismatch or range-bound market.
+📊 *Indicators:* VWAP: `{vwap_val:.1f}` | RSI: `{rsi:.1f}` | ATR: `{atr_val:.1f}`
+📈 *Sentiment:* PCR: `{pcr_val}` | VIX: `{vix_val:.1f}`
+⏸️ *Status:* Indicators or PCR sentiment mismatched.
 """
         return msg, buttons, None
 
@@ -389,7 +439,7 @@ def process_index(name, config, vix_val):
         estimated_premium = round(spot_price * config["prem_factor"], 1)
         prem_source = "Estimated Delta Model"
 
-    # ATR Dynamic Volatility Multipliers
+    # Dynamic ATR Risk & Position Sizing
     sl_pts = round(max(atr_val * 0.15, estimated_premium * 0.12), 1)
     t1_pts = round(sl_pts * 1.5, 1)
     t2_pts = round(sl_pts * 2.5, 1)
@@ -400,8 +450,11 @@ def process_index(name, config, vix_val):
     t2_price = round(estimated_premium + t2_pts, 1)
     t3_price = round(estimated_premium + t3_pts, 1)
 
+    rec_lots, max_risk_amt = calculate_position_size(estimated_premium, sl_price, config["lot_size"])
+    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     log_trade_to_csv({
-        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Timestamp": timestamp_str,
         "Index": name,
         "Signal": action_type,
         "Strike": recommended_strike,
@@ -412,17 +465,22 @@ def process_index(name, config, vix_val):
         "Target2": t2_price,
         "Target3": t3_price,
         "MTF_Status": f"5M:{trend_5m}|15M:{trend_15m}",
+        "PCR": pcr_val,
         "VIX": vix_val,
         "Status": "OPEN"
     })
 
     msg = f"""🔥 *{name} INSTITUTIONAL SIGNAL*
-📅 *Auto Expiry:* `{auto_expiry}`
+📅 *Auto Expiry:* `{auto_expiry}` | *Mode:* `{vix_warning}`
 
 📍 *Spot:* `{spot_price:.2f}` | *Bias:* {signal_direction}
-📊 *MTF Confirmation:* 5m ({trend_5m}) + 15m ({trend_15m}) 🟢
+📊 *MTF & PCR:* 5m ({trend_5m}) | 15m ({trend_15m}) | PCR ({pcr_val}) 🟢
 ⚡ *Trade:* BUY *{recommended_strike}* ({action_type})
 🏷️ *Price Feed:* {prem_source}
+
+🎯 *DYNAMIC POSITION SIZING (Capital ₹{int(TOTAL_CAPITAL)}):*
+• *Recommended Size:* `{rec_lots} Lot(s)` ({rec_lots * config['lot_size']} Qty)
+• *Estimated Trade Risk:* ₹{max_risk_amt} ({MAX_RISK_PER_TRADE_PCT}% Capital)
 
 📊 *DYNAMIC ATR VOLATILITY LEVELS:*
 • *Buy Range:* ₹{estimated_premium}
@@ -433,6 +491,7 @@ def process_index(name, config, vix_val):
 """
 
     trade_monitor_info = {
+        "timestamp": timestamp_str,
         "index": name,
         "strike": recommended_strike,
         "entry": estimated_premium,
@@ -463,22 +522,26 @@ def monitor_live_trades(active_trades):
                 if current_price >= trade["t3"]:
                     alert = f"🚀 *{trade['index']} TARGET 3 (RUNNER) HIT!* 🎉\n\nStrike: *{trade['strike']}*\nEntry: ₹{trade['entry']} ➡️ Current: ₹{current_price}\n🔥 *100% Multi-Lot Targets Accomplished!*"
                     send_telegram_message(alert)
+                    update_csv_trade_status(trade["timestamp"], "T3_HIT")
                     active_trades.remove(trade)
                 elif current_price >= trade["t2"] and not trade.get("t2_alert_sent"):
                     alert = f"🎯 *{trade['index']} TARGET 2 HIT!* 👏\n\nStrike: *{trade['strike']}*\nEntry: ₹{trade['entry']} ➡️ Current: ₹{current_price}\n💰 *ACTION:* Book additional 30% Lot profit. Trail remaining 20% Lot for T3."
                     send_telegram_message(alert)
+                    update_csv_trade_status(trade["timestamp"], "T2_HIT")
                     trade["t2_alert_sent"] = True
                 elif current_price >= trade["t1"] and not trade.get("t1_alert_sent"):
                     alert = f"🎯 *{trade['index']} TARGET 1 HIT!* 👏\n\nStrike: *{trade['strike']}*\nEntry: ₹{trade['entry']} ➡️ Current: ₹{current_price}\n🛡️ *ACTION:* Book 50% Lot Profit! Move Stop Loss to Entry Price (₹{trade['entry']}). Trade is now RISK-FREE."
                     send_telegram_message(alert)
+                    update_csv_trade_status(trade["timestamp"], "T1_HIT")
                     trade["t1_alert_sent"] = True
                 elif current_price <= trade["sl"]:
                     alert = f"🛑 *{trade['index']} STOP LOSS HIT!*\n\nStrike: *{trade['strike']}*\nEntry: ₹{trade['entry']} ➡️ Exit: ₹{current_price}\n🛡️ System exited position safely."
                     send_telegram_message(alert)
+                    update_csv_trade_status(trade["timestamp"], "SL_HIT")
                     active_trades.remove(trade)
 
 def main():
-    log_activity("🚀 Institutional Multi-Index Algo Engine (MTF + ATR + Auto-Expiry) Started")
+    log_activity("🚀 Institutional Multi-Index Algo Engine (MTF + PCR + ATR + Risk-Sizing) Started")
     now_hour = datetime.now().hour
 
     if now_hour >= 15 and datetime.now().minute >= 30:
@@ -508,6 +571,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
