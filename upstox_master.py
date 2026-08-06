@@ -9,12 +9,6 @@ from datetime import datetime
 TELEGRAM_BOT_TOKEN = "8642052658:AAH1o7maezHyHPgxeOxeiGLQ3wvu1JglvKI"
 TELEGRAM_CHAT_ID = "5598707490"
 
-# Default Risk Level Percentages
-BASE_SL_PERCENT = 15.0
-BASE_TARGET1_PERCENT = 25.0
-BASE_TARGET2_PERCENT = 50.0
-BASE_TARGET3_PERCENT = 85.0
-
 # Index Configuration Matrix
 INDICES = {
     "NIFTY": {
@@ -23,8 +17,6 @@ INDICES = {
         "tv_chart": "NSE:NIFTY",
         "step": 50,
         "prem_factor": 0.0052,
-        "expiry_type": "weekday",
-        "expiry_value": 1  # Tuesday
     },
     "SENSEX": {
         "upstox_key": "BSE_INDEX|SENSEX",
@@ -32,8 +24,6 @@ INDICES = {
         "tv_chart": "BSE:SENSEX",
         "step": 100,
         "prem_factor": 0.0045,
-        "expiry_type": "weekday",
-        "expiry_value": 3  # Thursday
     },
     "BANKNIFTY": {
         "upstox_key": "NSE_INDEX|Nifty Bank",
@@ -41,8 +31,6 @@ INDICES = {
         "tv_chart": "NSE:BANKNIFTY",
         "step": 100,
         "prem_factor": 0.0075,
-        "expiry_type": "monthly_date",
-        "expiry_value": 1  # 1st of Every Month
     }
 }
 
@@ -59,7 +47,6 @@ def send_telegram_message(message, inline_keyboard=None):
         "parse_mode": "Markdown"
     }
     
-    # Empty inline keyboard error protection
     if inline_keyboard and len(inline_keyboard) > 0:
         payload_dict["reply_markup"] = {"inline_keyboard": inline_keyboard}
 
@@ -113,25 +100,38 @@ def calculate_rsi(prices, period=14):
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
+def calculate_atr(highs, lows, closes, period=14):
+    """Calculates Average True Range (ATR) for dynamic volatility SL"""
+    if len(closes) < 2:
+        return 10.0
+    tr_list = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        tr_list.append(tr)
+    return sum(tr_list[-period:]) / min(len(tr_list), period) if tr_list else 10.0
+
 def calculate_vwap(high, low, close):
     return (high + low + close) / 3.0
 
 def get_multi_timeframe_data(yahoo_symbol):
     trend_5m = "NEUTRAL"
     trend_15m = "NEUTRAL"
+    closes_5m_all, highs_5m, lows_5m = [], [], []
     try:
-        # 5 Minute Data
         url_5m = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?range=1d&interval=5m"
         req = urllib.request.Request(url_5m, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode('utf-8'))
-            closes_5m = [p for p in data['chart']['result'][0]['indicators']['quote'][0]['close'] if p is not None]
-            if len(closes_5m) >= 5:
-                ema_fast = calculate_ema(closes_5m, 3)
-                ema_slow = calculate_ema(closes_5m, 5)
+            quote = data['chart']['result'][0]['indicators']['quote'][0]
+            closes_5m_all = [p for p in quote['close'] if p is not None]
+            highs_5m = [p for p in quote['high'] if p is not None]
+            lows_5m = [p for p in quote['low'] if p is not None]
+
+            if len(closes_5m_all) >= 5:
+                ema_fast = calculate_ema(closes_5m_all, 3)
+                ema_slow = calculate_ema(closes_5m_all, 5)
                 trend_5m = "BULLISH" if ema_fast > ema_slow else "BEARISH"
 
-        # 15 Minute Data
         url_15m = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?range=1d&interval=15m"
         req = urllib.request.Request(url_15m, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -145,7 +145,7 @@ def get_multi_timeframe_data(yahoo_symbol):
     except Exception as e:
         log_activity(f"MTF Fetch Warning: {e}")
 
-    return trend_5m, trend_15m
+    return trend_5m, trend_15m, highs_5m, lows_5m, closes_5m_all
 
 def get_india_vix():
     try:
@@ -157,6 +157,27 @@ def get_india_vix():
             return float(meta['regularMarketPrice'])
     except Exception:
         return 14.0
+
+def fetch_auto_expiry(instrument_key):
+    """Automatically selects nearest weekly option expiry from Upstox API"""
+    token = get_token()
+    if not token:
+        return "Nearest Expiry"
+    try:
+        encoded_key = urllib.parse.quote(instrument_key)
+        url = f"https://api.upstox.com/v2/option/chain?instrument_key={encoded_key}"
+        headers = {'Accept': 'application/json', 'Api-Version': '2.0', 'Authorization': f'Bearer {token}'}
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status == 200:
+                res = json.loads(resp.read().decode('utf-8'))
+                if 'data' in res and len(res['data']) > 0:
+                    exp = res['data'][0].get('expiry')
+                    if exp:
+                        return exp
+    except Exception as e:
+        log_activity(f"Auto Expiry Fetch Warning: {e}")
+    return "Nearest Expiry"
 
 def get_upstox_market_data(upstox_key):
     token = get_token()
@@ -203,13 +224,14 @@ def get_backup_data(yahoo_symbol):
         log_activity(f"Backup Feed Error: {e}")
     return None
 
-def get_option_chain_data(instrument_key, atm_strike):
+def get_option_chain_data(instrument_key, atm_strike, expiry_date):
     token = get_token()
     if not token:
         return None, None
     try:
         encoded_key = urllib.parse.quote(instrument_key)
-        url = f"https://api.upstox.com/v2/option/chain?instrument_key={encoded_key}&expiry_date="
+        exp_param = expiry_date if expiry_date != "Nearest Expiry" else ""
+        url = f"https://api.upstox.com/v2/option/chain?instrument_key={encoded_key}&expiry_date={exp_param}"
         headers = {
             'Accept': 'application/json',
             'Api-Version': '2.0',
@@ -229,29 +251,71 @@ def get_option_chain_data(instrument_key, atm_strike):
         log_activity(f"Option Chain API Info: {e}")
     return None, None
 
-def check_is_expiry(config):
-    now = datetime.now()
-    if config["expiry_type"] == "weekday":
-        return now.weekday() == config["expiry_value"]
-    elif config["expiry_type"] == "monthly_date":
-        return now.day == config["expiry_value"]
-    return False
-
 def log_trade_to_csv(data_row):
     file_exists = os.path.isfile("trade_journal.csv")
-    fields = ["Timestamp", "Index", "Signal", "Strike", "Spot", "Entry_Premium", "SL", "Target1", "Target2", "Target3", "MTF_Status", "VIX"]
+    fields = ["Timestamp", "Index", "Signal", "Strike", "Spot", "Entry_Premium", "SL", "Target1", "Target2", "Target3", "MTF_Status", "VIX", "Status"]
     try:
         with open("trade_journal.csv", "a", newline="") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fields)
             if not file_exists:
                 writer.writeheader()
+            if "Status" not in data_row:
+                data_row["Status"] = "OPEN"
             writer.writerow(data_row)
             log_activity("📝 Trade logged to trade_journal.csv successfully.")
     except Exception as e:
         log_activity(f"CSV Logging Error: {e}")
 
+def generate_daily_pnl_summary():
+    """Reads CSV and sends end-of-day summary to Telegram"""
+    if not os.path.isfile("trade_journal.csv"):
+        log_activity("No trade journal found for P&L summary.")
+        return
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    total_trades = 0
+    t1_hits = 0
+    t2_hits = 0
+    t3_hits = 0
+    sl_hits = 0
+
+    try:
+        with open("trade_journal.csv", "r") as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                if row["Timestamp"].startswith(today_str):
+                    total_trades += 1
+                    status = row.get("Status", "OPEN")
+                    if status == "T1_HIT":
+                        t1_hits += 1
+                    elif status == "T2_HIT":
+                        t2_hits += 1
+                    elif status == "T3_HIT":
+                        t3_hits += 1
+                    elif status == "SL_HIT":
+                        sl_hits += 1
+
+        if total_trades > 0:
+            win_count = t1_hits + t2_hits + t3_hits
+            win_rate = (win_count / total_trades) * 100
+
+            summary_msg = f"""📊 *DAILY ALGO PERFORMANCE REPORT*
+📅 *Date:* `{today_str}`
+
+📈 *Total Signals Generated:* `{total_trades}`
+🎯 *Target Hits:* `{win_count}` (T1: {t1_hits} | T2: {t2_hits} | T3: {t3_hits})
+🛑 *SL Hits:* `{sl_hits}`
+🔥 *Win Rate:* `{win_rate:.1f}%`
+
+🏆 *Summary Status:* {'🟢 HIGHLY PROFITABLE' if win_rate >= 50 else '🔴 DEFENSIVE DAY'}
+"""
+            send_telegram_message(summary_msg)
+            log_activity("📊 Daily P&L Summary sent to Telegram.")
+    except Exception as e:
+        log_activity(f"Daily Summary Error: {e}")
+
 def process_index(name, config, vix_val):
-    log_activity(f"⚡ Processing {name} with Multi-Timeframe Engine...")
+    log_activity(f"⚡ Processing {name} with MTF + Dynamic ATR Engine...")
     
     res = get_upstox_market_data(config["upstox_key"])
     if res:
@@ -265,29 +329,11 @@ def process_index(name, config, vix_val):
             log_activity(f"❌ Failed to fetch market data for {name}")
             return None, None, None
 
-    # Multi-Timeframe Alignment Check (5m vs 15m)
-    trend_5m, trend_15m = get_multi_timeframe_data(config["yahoo_symbol"])
+    trend_5m, trend_15m, h5, l5, c5 = get_multi_timeframe_data(config["yahoo_symbol"])
+    auto_expiry = fetch_auto_expiry(config["upstox_key"])
 
-    vix_modifier = 1.0
-    if vix_val > 16.0:
-        vix_modifier = 1.25
-    elif vix_val < 11.0:
-        vix_modifier = 0.85
-
-    is_expiry_day = check_is_expiry(config)
-
-    if is_expiry_day:
-        sl_pct = 10.0 * vix_modifier
-        t1_pct = 40.0 * vix_modifier
-        t2_pct = 100.0 * vix_modifier
-        t3_pct = 150.0 * vix_modifier
-        expiry_tag = "🔥 *EXPIRY DAY (HERO-ZERO MODE)*"
-    else:
-        sl_pct = BASE_SL_PERCENT * vix_modifier
-        t1_pct = BASE_TARGET1_PERCENT * vix_modifier
-        t2_pct = BASE_TARGET2_PERCENT * vix_modifier
-        t3_pct = BASE_TARGET3_PERCENT * vix_modifier
-        expiry_tag = "📅 Regular Session"
+    # Calculate ATR Volatility factor
+    atr_val = calculate_atr(h5, l5, c5) if h5 and l5 and c5 else 15.0
 
     ema9 = calculate_ema(close_series, 3)
     ema21 = calculate_ema(close_series, 5)
@@ -297,15 +343,15 @@ def process_index(name, config, vix_val):
     step = config["step"]
     atm_strike = round(spot_price / step) * step
 
-    # Setup Buttons
     tv_symbol = config["tv_chart"]
     oc_url = "https://www.nseindia.com/option-chain" if "NIFTY" in name and "BANK" not in name else "https://upstox.com/option-chain/"
+    
+    # Callback-style interactive UI buttons
     buttons = [
         [{"text": f"📈 {name} Chart", "url": f"https://in.tradingview.com/chart/?symbol={tv_symbol}"},
          {"text": "📊 Option Chain", "url": oc_url}]
     ]
 
-    # Technical + VWAP + Multi-Timeframe Alignment Check
     if spot_price > ema9 and ema9 >= ema21 and rsi > 52 and spot_price >= vwap_val and trend_5m == "BULLISH" and trend_15m == "BULLISH":
         action_type = "CALL (CE)"
         signal_direction = "🟢 STRONG BULLISH (5M + 15M ALIGNED)"
@@ -322,16 +368,16 @@ def process_index(name, config, vix_val):
 
     if not trade_active:
         msg = f"""🔥 *{name} MARKET STATUS*
-{expiry_tag}
+📅 *Auto Expiry:* `{auto_expiry}`
 
 📍 *Spot:* `{spot_price:.2f}` | *Bias:* {signal_direction}
 📊 *Trend Alignment:* 5M (`{trend_5m}`) | 15M (`{trend_15m}`)
-📊 *Indicators:* VWAP: `{vwap_val:.1f}` | RSI: `{rsi:.1f}` | VIX: `{vix_val:.1f}`
+📊 *Indicators:* VWAP: `{vwap_val:.1f}` | RSI: `{rsi:.1f}` | ATR: `{atr_val:.1f}` | VIX: `{vix_val:.1f}`
 ⏸️ *Status:* Timeframe mismatch or range-bound market.
 """
         return msg, buttons, None
 
-    ce_ltp, pe_ltp = get_option_chain_data(config["upstox_key"], atm_strike)
+    ce_ltp, pe_ltp = get_option_chain_data(config["upstox_key"], atm_strike, auto_expiry)
     
     if "CE" in action_type and ce_ltp and ce_ltp > 0:
         estimated_premium = ce_ltp
@@ -343,10 +389,11 @@ def process_index(name, config, vix_val):
         estimated_premium = round(spot_price * config["prem_factor"], 1)
         prem_source = "Estimated Delta Model"
 
-    sl_pts = round(estimated_premium * (sl_pct / 100), 1)
-    t1_pts = round(estimated_premium * (t1_pct / 100), 1)
-    t2_pts = round(estimated_premium * (t2_pct / 100), 1)
-    t3_pts = round(estimated_premium * (t3_pct / 100), 1)
+    # ATR Dynamic Volatility Multipliers
+    sl_pts = round(max(atr_val * 0.15, estimated_premium * 0.12), 1)
+    t1_pts = round(sl_pts * 1.5, 1)
+    t2_pts = round(sl_pts * 2.5, 1)
+    t3_pts = round(sl_pts * 4.0, 1)
 
     sl_price = round(estimated_premium - sl_pts, 1)
     t1_price = round(estimated_premium + t1_pts, 1)
@@ -365,20 +412,21 @@ def process_index(name, config, vix_val):
         "Target2": t2_price,
         "Target3": t3_price,
         "MTF_Status": f"5M:{trend_5m}|15M:{trend_15m}",
-        "VIX": vix_val
+        "VIX": vix_val,
+        "Status": "OPEN"
     })
 
     msg = f"""🔥 *{name} INSTITUTIONAL SIGNAL*
-{expiry_tag}
+📅 *Auto Expiry:* `{auto_expiry}`
 
 📍 *Spot:* `{spot_price:.2f}` | *Bias:* {signal_direction}
 📊 *MTF Confirmation:* 5m ({trend_5m}) + 15m ({trend_15m}) 🟢
 ⚡ *Trade:* BUY *{recommended_strike}* ({action_type})
 🏷️ *Price Feed:* {prem_source}
 
-📊 *DYNAMIC MULTI-LOT LEVELS:*
+📊 *DYNAMIC ATR VOLATILITY LEVELS:*
 • *Buy Range:* ₹{estimated_premium}
-• *SL (-{sl_pct:.1f}%):* ₹{sl_price} (-{sl_pts} pts)
+• *SL (ATR Risk):* ₹{sl_price} (-{sl_pts} pts)
 • *Target 1 (Book 50% Lot):* ₹{t1_price} (+{t1_pts} pts)
 • *Target 2 (Book 30% Lot):* ₹{t2_price} (+{t2_pts} pts)
 • *Target 3 (Trail 20% Runner):* ₹{t3_price} (+{t3_pts} pts)
@@ -394,6 +442,7 @@ def process_index(name, config, vix_val):
         "t3": t3_price,
         "upstox_key": config["upstox_key"],
         "atm_strike": atm_strike,
+        "expiry": auto_expiry,
         "action": action_type
     }
 
@@ -407,7 +456,7 @@ def monitor_live_trades(active_trades):
     for _ in range(5):
         time.sleep(30)
         for trade in active_trades:
-            ce_ltp, pe_ltp = get_option_chain_data(trade["upstox_key"], trade["atm_strike"])
+            ce_ltp, pe_ltp = get_option_chain_data(trade["upstox_key"], trade["atm_strike"], trade["expiry"])
             current_price = ce_ltp if "CE" in trade["action"] else pe_ltp
 
             if current_price and current_price > 0:
@@ -429,7 +478,13 @@ def monitor_live_trades(active_trades):
                     active_trades.remove(trade)
 
 def main():
-    log_activity("🚀 Institutional Multi-Index Algo Engine (MTF + Multi-Lot) Started")
+    log_activity("🚀 Institutional Multi-Index Algo Engine (MTF + ATR + Auto-Expiry) Started")
+    now_hour = datetime.now().hour
+
+    if now_hour >= 15 and datetime.now().minute >= 30:
+        generate_daily_pnl_summary()
+        return
+
     vix_val = get_india_vix()
     full_alert = f"🎯 *MULTI-INDEX TRADING ALGO REPORT*\n*India VIX:* `{vix_val:.2f}`\n\n"
     all_buttons = []
@@ -453,6 +508,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
